@@ -14,23 +14,14 @@
 // NSAlert.
 //
 // ─────────────────────────────────────────────────────────────────────────────
-// HOST DIVERGENCE (documented, intentional — no host changes):
-//   The Windows plugin pushes its result text into the status bar continuously
-//   via NPPM_SETSTATUSBAR(STATUSBAR_DOC_TYPE, …) on every SCN_UPDATEUI.
-//   The Nextpad++ macOS host does NOT implement NPPM_SETSTATUSBAR (it falls
-//   through to the dispatcher's `default:` → logs "Unimplemented NPPM message"
-//   and returns 0), and its status bar exposes no plugin-addressable segment.
-//   See notepad-plus-plus-macos/src/NppPluginManager.mm (-handleNppMessage:)
-//   and MainWindowController.mm (only _statusLeft/_statusRight text fields).
-//
-//   Hacking the host is forbidden, so the result is surfaced through the
-//   nearest faithful macOS equivalent: the "Show Character Info" command
-//   computes the info for the character under the cursor on demand and shows
-//   it in an alert — identical data, on demand instead of passively. The live
-//   SCN_UPDATEUI / NPPN_BUFFERACTIVATED path still tracks the current codepoint
-//   (cheap), so the command always reflects the current caret instantly. If the
-//   host later implements NPPM_SETSTATUSBAR, restore the passive behavior by
-//   routing showCurrentCharInfo()'s string there instead of to the alert.
+// STATUS BAR (live passive readout):
+//   Like the Windows plugin, the char-under-caret info is pushed into the status
+//   bar continuously via NPPM_SETSTATUSBAR(STATUSBAR_DOC_TYPE, …) on every
+//   SCN_UPDATEUI (see refreshCharacterInfo). The Nextpad++ macOS host implements
+//   NPPM_SETSTATUSBAR by routing the text to a dedicated middle status-bar field
+//   — the host's left ("Ln/Col…") and right ("language | encoding | …") blocks
+//   are left untouched, and the field is left-aligned and auto-fills the gap.
+//   "Show Character Info" toggles the readout on/off (empty string clears it).
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "NppPluginInterfaceMac.h"
@@ -198,52 +189,43 @@ uint32_t codepointUnderCaret(bool &atEnd) {
     return decodeUtf8Char(buffer, bytesRead);
 }
 
-// Keep gLastCodepoint current. Called from the live notification path. Cheap;
-// no UI. (On Windows this also wrote the status bar — unavailable here, see the
-// HOST DIVERGENCE note at the top of the file.)
+// Push text into the host status bar's plugin field (NPPM_SETSTATUSBAR). On the
+// macOS host this routes to a dedicated middle segment that persists until we
+// change it; an empty string clears it. (whichPart is ignored by the host — any
+// value maps to the one middle field; we keep STATUSBAR_DOC_TYPE for parity.)
+static void setStatusBarText(const char *text) {
+    nppData._sendMessage(nppData._nppHandle, NPPM_SETSTATUSBAR,
+                         (uintptr_t)STATUSBAR_DOC_TYPE, (intptr_t)(text ? text : ""));
+}
+
+// Refresh the live character readout. Called from the notification path on every
+// cursor move → streams the char-under-caret info into the status bar the way the
+// Windows plugin did. When reporting is OFF, we release (clear) our field.
 void refreshCharacterInfo() {
     if (!gShowCharInfo) {
         gLastCodepoint = 0;
+        setStatusBarText("");
         return;
     }
     bool atEnd = false;
-    gLastCodepoint = codepointUnderCaret(atEnd);
+    uint32_t cp = codepointUnderCaret(atEnd);
+    gLastCodepoint = cp;
+    if (atEnd)          setStatusBarText("End of document");
+    else if (cp == 0)   setStatusBarText("");
+    else                setStatusBarText(formatCharacterCodes(cp).c_str());
 }
 
 // ── commands ─────────────────────────────────────────────────────────────────
 void showCurrentCharInfo() {
     @autoreleasepool {
-        // Toggle semantics preserved: this command flips the on/off state, like
-        // the Windows "Show Character Info". When turned ON we also report the
-        // current character immediately; when turned OFF we just acknowledge.
+        // Toggle the live status-bar readout on/off (Windows parity). The char
+        // info now streams into the host status bar's plugin field on every cursor
+        // move (see refreshCharacterInfo), so this command just flips the state,
+        // updates the menu check, and refreshes the field immediately — no modal.
         gShowCharInfo = !gShowCharInfo;
         nppData._sendMessage(nppData._nppHandle, NPPM_SETMENUITEMCHECK,
                              (uintptr_t)funcItem[0]._cmdID, gShowCharInfo ? 1 : 0);
-
-        NSAlert *a = [[NSAlert alloc] init];
-        a.messageText = @"Emoji Description";
-        a.alertStyle  = NSAlertStyleInformational;
-
-        if (!gShowCharInfo) {
-            a.informativeText = @"Character info reporting turned OFF.";
-            [a runModal];
-            return;
-        }
-
-        bool atEnd = false;
-        uint32_t cp = codepointUnderCaret(atEnd);
-        gLastCodepoint = cp;
-
-        NSString *body;
-        if (atEnd) {
-            body = @"End of document — no character under the cursor.";
-        } else if (cp == 0) {
-            body = @"No character under the cursor.";
-        } else {
-            body = [NSString stringWithUTF8String:formatCharacterCodes(cp).c_str()];
-        }
-        a.informativeText = body;
-        [a runModal];
+        refreshCharacterInfo();               // show current char, or clear when OFF
     }
 }
 
@@ -253,7 +235,7 @@ void aboutDialog() {
         a.messageText = @"About Emoji Description";
         a.alertStyle  = NSAlertStyleInformational;
         a.informativeText =
-            @"Emoji Description v0.1.0 (macOS port)\n\n"
+            @"Emoji Description v1.0.0 (macOS port)\n\n"
              "Shows detailed character-encoding information for the character "
              "under the cursor.\n\n"
              "Reports for any character:\n"
@@ -262,18 +244,11 @@ void aboutDialog() {
              "- HTML entity (&#XXXX;)\n"
              "- UTF-8 byte sequence\n\n"
              "Supports all Unicode characters including emoji.\n\n"
-             "Note: the Nextpad++ macOS host does not expose a plugin-writable "
-             "status bar, so \"Show Character Info\" reports the current "
-             "character on demand instead of passively in the status bar.\n\n"
-             "Original Windows plugin by Ruberoid.\n"
-             "https://github.com/Ruberoid/npp_emoji_description";
+             "\"Show Character Info\" toggles a live readout in the status bar.\n\n"
+             "Original Windows plugin by Ruberoid (GPL v2)\n"
+             "macOS port by Andrey Letov";
         [a addButtonWithTitle:@"OK"];
-        [a addButtonWithTitle:@"Project Page"];
-        NSModalResponse r = [a runModal];
-        if (r == NSAlertSecondButtonReturn) {
-            [[NSWorkspace sharedWorkspace]
-                openURL:[NSURL URLWithString:@"https://github.com/Ruberoid/npp_emoji_description"]];
-        }
+        [a runModal];
     }
 }
 
@@ -311,6 +286,11 @@ extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
         case NPPN_BUFFERACTIVATED:
             // Switched documents — refresh.
             refreshCharacterInfo();
+            break;
+
+        case NPPN_SHUTDOWN:
+            // Don't leave our text sitting in the shared status-bar field.
+            setStatusBarText("");
             break;
 
         default:
